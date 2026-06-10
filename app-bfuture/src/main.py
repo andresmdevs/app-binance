@@ -15,6 +15,8 @@ Por defecto opera contra TESTNET (BINANCE_TESTNET=true). Abrir/cerrar posición 
 confirmación y toda orden se valida con los filtros del símbolo.
 """
 import asyncio
+import hashlib
+import hmac as _hmac
 import os
 import secrets as _secrets
 from decimal import Decimal
@@ -40,6 +42,7 @@ from binance import (
     open_scalp,
 )
 from binance import autoscalp
+from binance import earn as earn_mod
 from binance import market as market_mod
 from binance import pnl as pnl_mod
 from binance.autoscalp import auto_levels, momentum_ok
@@ -51,6 +54,9 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 API_KEY = os.getenv("BINANCE_API_KEY")
 SECRET_KEY = os.getenv("BINANCE_API_SECRET")
+# Producción SOLO LECTURA (módulo Earn / análisis). El trading sigue en testnet.
+PROD_API_KEY = os.getenv("BINANCE_PROD_API_KEY")
+PROD_API_SECRET = os.getenv("BINANCE_PROD_API_SECRET")
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -379,6 +385,36 @@ class TradingApp(ft.Column):
             padding=12, expand=True,
         )
 
+        # --- Earn (producción solo-lectura) -----------------------------------
+        self._spot = None              # cliente spot perezoso (PROD read-only)
+        self._earn_products = None     # cache de productos (peso 150 por página)
+        self.earn_summary = ft.Text("Pulsa Actualizar para cargar tus datos de Earn.",
+                                    size=13, color=GREY)
+        self.earn_positions_col = ft.Column(spacing=8, tight=True)
+        self.earn_top_col = ft.Column(spacing=4, tight=True)
+        earn_tab = ft.Container(
+            content=ft.Column([
+                ft.Row([
+                    ft.Text("Simple Earn (producción · solo lectura)",
+                            weight=ft.FontWeight.BOLD),
+                    ft.Container(expand=True),
+                    ft.FilledButton("Actualizar", icon=ft.Icons.REFRESH,
+                                    on_click=self.on_load_earn),
+                ], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                self.earn_summary,
+                ft.Divider(height=8),
+                ft.Text("Mis posiciones", weight=ft.FontWeight.BOLD, size=14),
+                self.earn_positions_col,
+                ft.Divider(height=8),
+                ft.Text("Top APRs disponibles (flexible)", weight=ft.FontWeight.BOLD,
+                        size=14),
+                ft.Text("APRs en fracción anual; los muy altos suelen ser promocionales, "
+                        "con tope y pagados en el propio token.", size=11, color=GREY),
+                self.earn_top_col,
+            ], spacing=8, scroll=ft.ScrollMode.AUTO),
+            padding=16, expand=True,
+        )
+
         self.tabs = ft.Tabs(
             selected_index=0, animation_duration=250, expand=True,
             tabs=[
@@ -386,6 +422,7 @@ class TradingApp(ft.Column):
                 ft.Tab(text="Órdenes", icon=ft.Icons.LIST_ALT_ROUNDED, content=orders_tab),
                 ft.Tab(text="Gráfico", icon=ft.Icons.SHOW_CHART_ROUNDED, content=chart_tab),
                 ft.Tab(text="Historial", icon=ft.Icons.HISTORY_ROUNDED, content=history_tab),
+                ft.Tab(text="Earn", icon=ft.Icons.SAVINGS_ROUNDED, content=earn_tab),
             ],
         )
         self.controls = [
@@ -1233,6 +1270,80 @@ class TradingApp(ft.Column):
             ))
         self.page.update()
 
+    # --- Earn (producción, solo lectura) ---------------------------------------
+    async def on_load_earn(self, e=None):
+        if not PROD_API_KEY or not PROD_API_SECRET:
+            self.earn_summary.value = (
+                "⚠ Faltan BINANCE_PROD_API_KEY / BINANCE_PROD_API_SECRET (clave de "
+                "producción de SOLO LECTURA). En Render: Environment → añadir → "
+                "redeploy. En local: app-bfuture/.env.")
+            self.earn_summary.color = RED
+            self.page.update()
+            return
+        self.earn_summary.value = "Cargando datos de Earn…"
+        self.earn_summary.color = GREY
+        self.page.update()
+        if self._spot is None:
+            self._spot = earn_mod.make_spot_client(PROD_API_KEY, PROD_API_SECRET)
+        try:
+            acct = await earn_mod.fetch_account(self._spot)
+            positions = await earn_mod.fetch_positions(self._spot)
+            self._earn_products = await earn_mod.fetch_products(self._spot)
+        except BinanceError as ex:
+            self.earn_summary.value = f"Error Earn: {ex}"
+            self.earn_summary.color = RED
+            self.page.update()
+            return
+
+        total = float(acct.get("totalAmountInUSDT", 0) or 0)
+        s = earn_mod.summarize_positions(positions)
+        self.earn_summary.value = (
+            f"Total en Earn ≈ {fmt_usd(total)} · {s['count']} posiciones · "
+            f"mejor APR propio {s['best_apr_held'] * 100:.2f}%")
+        self.earn_summary.color = GREEN
+
+        self.earn_positions_col.controls.clear()
+        if not positions:
+            self.earn_positions_col.controls.append(
+                ft.Text("Sin posiciones en Earn.", italic=True, color=GREY))
+        for p in positions:
+            self.earn_positions_col.controls.append(ft.Container(
+                content=ft.Row([
+                    ft.Column([
+                        ft.Text(f"{p.asset} · {p.kind}", weight=ft.FontWeight.BOLD),
+                        ft.Text(f"cantidad {p.amount:g} · ayer +{p.yesterday_rewards:g} "
+                                f"· acumulado {p.cumulative_rewards:g} {p.asset}",
+                                size=11, color=GREY),
+                    ], expand=True, spacing=2),
+                    ft.Text(f"{p.apr * 100:.2f}%", weight=ft.FontWeight.BOLD,
+                            color=GREEN if p.apr > 0 else GREY),
+                ]),
+                padding=10, border_radius=8,
+                bgcolor=ft.Colors.with_opacity(0.04, ft.Colors.WHITE),
+            ))
+
+        held = {p.asset for p in positions}
+        self.earn_top_col.controls.clear()
+        for item in earn_mod.top_products(self._earn_products, limit=10,
+                                          held_assets=held):
+            pr = item["product"]
+            extras = (" · MÍO" if item["mine"] else "") + \
+                     (" · +promo por tramos" if pr.has_bonus_tiers else "")
+            self.earn_top_col.controls.append(ft.Container(
+                content=ft.Row([
+                    ft.Text(pr.asset, weight=ft.FontWeight.BOLD, width=110),
+                    ft.Text(f"mín {pr.min_purchase:g}", size=11, color=GREY, expand=True),
+                    ft.Text(f"{pr.apr * 100:.2f}%{extras}", weight=ft.FontWeight.BOLD,
+                            color=ft.Colors.AMBER_200 if item["mine"] else GREEN),
+                ]),
+                padding=ft.padding.symmetric(horizontal=10, vertical=6),
+                border_radius=6,
+                bgcolor=ft.Colors.with_opacity(0.06 if item["mine"] else 0.03,
+                                               ft.Colors.AMBER if item["mine"]
+                                               else ft.Colors.WHITE),
+            ))
+        self.page.update()
+
     # --- Limpieza -------------------------------------------------------------
     async def shutdown(self):
         for s in (self._user_stream, self._mark_stream, self._chart_stream):
@@ -1240,6 +1351,8 @@ class TradingApp(ft.Column):
                 await s.stop()
         if self._fallback_task:
             self._fallback_task.cancel()
+        if self._spot is not None:
+            await self._spot.close()
         await self.client.close()
 
 
@@ -1253,6 +1366,19 @@ def access_key_ok(provided: str) -> bool:
     if not ACCESS_KEY:
         return True
     return _secrets.compare_digest((provided or "").strip(), ACCESS_KEY)
+
+
+def session_token() -> str:
+    """Token de sesión derivado de la clave (estateless: sobrevive a reinicios del
+    server). Se invalida cambiando APP_ACCESS_KEY en Render."""
+    if not ACCESS_KEY:
+        return ""
+    return _hmac.new(ACCESS_KEY.encode(), b"bf-session-v1", hashlib.sha256).hexdigest()
+
+
+def session_token_ok(stored) -> bool:
+    tok = session_token()
+    return bool(tok) and isinstance(stored, str) and _secrets.compare_digest(stored, tok)
 
 
 async def _launch_app(page: ft.Page):
@@ -1278,6 +1404,15 @@ async def main(page: ft.Page):
         await _launch_app(page)
         return
 
+    # Sesión recordada: si el dispositivo ya entró una vez, pasa directo (0 clicks).
+    try:
+        stored = await page.client_storage.get_async("bf.session")
+    except Exception:
+        stored = None
+    if session_token_ok(stored):
+        await _launch_app(page)
+        return
+
     # --- Pantalla de acceso (la app queda expuesta en una URL pública) ---
     key_field = ft.TextField(label="Clave de acceso", password=True,
                              can_reveal_password=True, width=280,
@@ -1286,6 +1421,10 @@ async def main(page: ft.Page):
 
     async def try_enter(e=None):
         if access_key_ok(key_field.value):
+            try:  # recordar este dispositivo para próximas aperturas
+                await page.client_storage.set_async("bf.session", session_token())
+            except Exception:
+                pass
             page.clean()
             await _launch_app(page)
         else:
