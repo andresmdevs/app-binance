@@ -8,7 +8,18 @@ authors = [
     { name = "Flet developer", email = "you@example.com" }
 ]
 dependencies = [
-  "flet==0.28.3"
+  "aiohttp>=3.13.5",
+  "flet==0.28.3",
+  "python-dotenv>=1.2.1",
+]
+
+[dependency-groups]
+# Solo para el backtester (carpeta backtest/, investigación).
+# NO se empaqueta en el app móvil: el bundle solo incluye `src/` (tool.flet.app.path).
+backtest = [
+  "pandas>=2.0",
+  "numpy>=1.24",
+  "matplotlib>=3.7",
 ]
 
 [tool.flet]
@@ -32,7 +43,13 @@ path = "src"
 [tool.uv]
 dev-dependencies = [
     "flet[all]==0.28.3",
+    "pytest>=8",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"
 
 [tool.poetry]
 package-mode = false

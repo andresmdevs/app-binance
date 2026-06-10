@@ -100,6 +100,8 @@ ipython_config.py
 #   commonly ignored for libraries.
 #   https://python-poetry.org/docs/basic-usage/#commit-your-poetrylock-file-to-version-control
 *.lock
+# uv.lock SÍ se versiona: Render lo necesita para `uv sync --frozen`
+!uv.lock
 
 # pdm
 #   Similar to Pipfile.lock, it is generally recommended to include pdm.lock in version control.
@@ -161,3 +163,10 @@ cython_debug/
 
 # Flet
 storage/
+
+# Log de auditoría de órdenes (no subir operaciones)
+logs/
+
+# Backtester (investigación)
+backtest/.cache/
+backtest/*.png

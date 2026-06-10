@@ -1,0 +1,29 @@
+# Blueprint de Render para la app de futuros (Flet web).
+#
+# IMPORTANTE:
+#  - region: frankfurt -> obligatorio: Binance bloquea IPs de EE.UU. (HTTP 451).
+#  - plan: free -> el servicio DUERME tras ~15 min sin trafico y tarda ~1 min en
+#    despertar. Dormido NO corre nada del lado cliente (trailing/cierre por
+#    tiempo); los TP/SL si persisten porque viven en el exchange.
+#  - Las credenciales se cargan en el dashboard de Render (sync: false), NUNCA
+#    en este archivo ni en el repo.
+#  - El disco es efimero: logs/ (auditoria) se pierde al dormir/redeploy. El
+#    historial real vive en Binance (income), asi que no es critico.
+services:
+  - type: web
+    name: bot-futuros
+    runtime: python
+    region: frankfurt
+    plan: free
+    rootDir: app-bfuture
+    buildCommand: pip install uv && uv sync --frozen
+    startCommand: uv run python src/main.py
+    envVars:
+      - key: BINANCE_TESTNET
+        value: "true"          # cambia a "false" SOLO cuando decidas produccion
+      - key: BINANCE_API_KEY
+        sync: false            # se ingresa en el dashboard de Render
+      - key: BINANCE_API_SECRET
+        sync: false
+      - key: APP_ACCESS_KEY
+        sync: false            # clave de login de la app (elige una larga)
