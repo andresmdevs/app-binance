@@ -35,6 +35,7 @@ class ScalpConfig:
     leverage: int = 10
     entry_type: str = "MARKET"     # "MARKET" (taker) | "MAKER" (LIMIT GTX = post-only)
     entry_timeout_s: int = 30      # tiempo de espera del fill maker antes de cancelar
+    margin_type: str = "ISOLATED"  # "ISOLATED" (pérdida capada al margen) | "CROSSED"
 
 
 async def _wait_position(client, symbol: str, *, attempts: int = 8, delay: float = 0.4) -> bool:
@@ -121,6 +122,11 @@ async def open_scalp(
 
     is_market = config.entry_type.upper() != "MAKER"
     qty = sf.format_qty(config.notional / mark, market=is_market)
+    if config.margin_type:
+        try:
+            await trader.set_margin_type(symbol, config.margin_type)
+        except BinanceAPIError:
+            pass  # ya está así / no cambiable con posición abierta; no bloquea la entrada
     await trader.set_leverage(symbol, config.leverage)
 
     if is_market:

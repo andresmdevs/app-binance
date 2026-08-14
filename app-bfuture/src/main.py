@@ -43,8 +43,11 @@ from binance import (
 )
 from binance import autoscalp
 from binance import earn as earn_mod
+from binance import llm as llm_mod
 from binance import market as market_mod
 from binance import pnl as pnl_mod
+from binance import scanner
+from binance import signals as sg
 from binance.autoscalp import auto_levels, momentum_ok
 from binance.forwardtest import select_candidates
 
@@ -97,6 +100,10 @@ AUTO_MARGIN = float(os.getenv("AUTO_MARGIN", "0.30"))         # capital/orden en
 AUTO_MAX_PRICE = float(os.getenv("AUTO_MAX_PRICE", "0.5"))    # solo monedas baratas
 AUTO_MIN_VOL = float(os.getenv("AUTO_MIN_VOL", "1000000"))    # liquidez mínima
 TRAIL_PCT = float(os.getenv("TRAIL_PCT", "0.005"))           # trailing del stop (0.5%)
+
+# --- Radar: dimensionado de riesgo definido (plan acordado) ---
+RADAR_RISK_FRAC = float(os.getenv("RADAR_RISK_FRAC", "0.10"))  # margen = % del disponible (~$0.69)
+LEV_SAFETY_BUFFER = 1.6  # la liquidación debe quedar más lejos que el SL × este buffer
 
 GREEN = ft.Colors.GREEN_ACCENT_400
 RED = ft.Colors.RED_ACCENT_200
@@ -159,6 +166,12 @@ class TradingApp(ft.Column):
         self._chart_closes: list[float] = []
         self._chart_last_open = None
         self._chart_symbol_active = None
+
+        # Estado del Radar (motor de señales). Cliente público mainnet aparte:
+        # los endpoints /futures/data/* no existen en testnet.
+        self._scan_client = None
+        self._last_setups = []
+        self._winner_stats = None  # perfil de ganadoras (de analyzeprod); se carga aparte
 
         # --- Cabecera --------------------------------------------------------
         self.env_badge = ft.Container(
@@ -415,6 +428,53 @@ class TradingApp(ft.Column):
             padding=16, expand=True,
         )
 
+        # --- Radar (motor de señales) -----------------------------------------
+        self.radar_status = ft.Text("Pulsa Escanear para buscar oportunidades.",
+                                    size=13, color=GREY)
+        self.radar_universe = ft.Dropdown(
+            label="Universo", width=110, value="30", dense=True,
+            options=[ft.dropdown.Option(n) for n in ("20", "30", "50")])
+        self.radar_topn = ft.Dropdown(
+            label="Máx", width=90, value="3", dense=True,
+            options=[ft.dropdown.Option(n) for n in ("3", "5", "8")])
+        self.radar_list = ft.Column(spacing=10, tight=True)
+        self.radar_symbol = ft.TextField(
+            label="Analizar símbolo (ej. ONUSDT)", dense=True, text_size=13, width=260,
+            capitalization=ft.TextCapitalization.CHARACTERS,
+            on_submit=self.on_analyze_symbol)
+        self.radar_chat_input = ft.TextField(
+            label="Pregúntale al radar… (¿por qué SOL? · solo shorts)", dense=True,
+            text_size=13, expand=True, on_submit=self.on_radar_chat)
+        self.radar_chat_out = ft.Text("", size=12, color=GREY, selectable=True)
+        radar_tab = ft.Container(
+            content=ft.Column([
+                ft.Row([
+                    ft.Text("Radar", weight=ft.FontWeight.BOLD),
+                    ft.Text("mercado en vivo · mainnet solo lectura", size=11, color=GREY),
+                    ft.Container(expand=True),
+                    self.radar_universe, self.radar_topn,
+                    ft.FilledButton("Escanear", icon=ft.Icons.RADAR, on_click=self.on_scan),
+                ], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                ft.Text("Detecta zonas S/R por volumen + flujo (OI/funding/taker), "
+                        "puntúa y ordena 1-3 entradas. 'Preparar orden' NO ejecuta: "
+                        "precarga y tú confirmas.", size=11, color=GREY),
+                ft.Row([self.radar_symbol,
+                        ft.FilledButton("Analizar", icon=ft.Icons.SEARCH,
+                                        on_click=self.on_analyze_symbol)],
+                       vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=8),
+                self.radar_status,
+                self.radar_list,
+                ft.Divider(height=8),
+                ft.Text("Chat del radar (LLM local)", size=12, color=GREY,
+                        weight=ft.FontWeight.BOLD),
+                ft.Row([self.radar_chat_input,
+                        ft.IconButton(ft.Icons.SEND, tooltip="Preguntar",
+                                      on_click=self.on_radar_chat)]),
+                self.radar_chat_out,
+            ], spacing=10, scroll=ft.ScrollMode.AUTO),
+            padding=16, expand=True,
+        )
+
         self.tabs = ft.Tabs(
             selected_index=0, animation_duration=250, expand=True,
             tabs=[
@@ -423,6 +483,7 @@ class TradingApp(ft.Column):
                 ft.Tab(text="Gráfico", icon=ft.Icons.SHOW_CHART_ROUNDED, content=chart_tab),
                 ft.Tab(text="Historial", icon=ft.Icons.HISTORY_ROUNDED, content=history_tab),
                 ft.Tab(text="Earn", icon=ft.Icons.SAVINGS_ROUNDED, content=earn_tab),
+                ft.Tab(text="Radar", icon=ft.Icons.RADAR, content=radar_tab),
             ],
         )
         self.controls = [
@@ -642,6 +703,11 @@ class TradingApp(ft.Column):
             await self.on_load_chart()   # carga inicial del gráfico
         except BinanceError as e:
             self._set_status(f"Error: {e}", RED)
+        # Modo demo (RADAR_DEMO=1): abre en la pestaña Radar y escanea al iniciar.
+        if os.getenv("RADAR_DEMO"):
+            self.tabs.selected_index = len(self.tabs.tabs) - 1
+            self.page.update()
+            await self.on_scan()
 
     # --- Monitoreo por WebSocket ---------------------------------------------
     def toggle_monitoring(self, e):
@@ -1344,6 +1410,227 @@ class TradingApp(ft.Column):
             ))
         self.page.update()
 
+    # --- Radar: escaneo, render, preparar orden, chat ------------------------
+    def _scan_cli(self):
+        """Cliente PÚBLICO de mainnet solo para datos de mercado del Radar
+        (los endpoints /futures/data/* no existen en testnet)."""
+        if self._scan_client is None:
+            self._scan_client = BinanceFuturesClient(testnet=False)
+        return self._scan_client
+
+    async def on_scan(self, e=None):
+        self.radar_status.value = "Escaneando mercado (datos reales)…"
+        self.radar_status.color = GREY
+        self.radar_list.controls.clear()
+        self.page.update()
+        cli = self._scan_cli()
+        try:
+            await cli.sync_time()
+            tickers = await market_mod.fetch_tickers(cli, allowed=self.filters.symbols())
+            universe = int(self.radar_universe.value or "30")
+            symbols = [t.symbol for t in sorted(
+                tickers, key=lambda t: t.quote_volume, reverse=True)[:universe]]
+            cap = max(self._available_balance, 7.0) * max(1, self._leverage)
+            setups = await scanner.scan_market(
+                cli, symbols, top_n=int(self.radar_topn.value or "3"),
+                capacity=cap, min_notional=5.0, winner_stats=self._winner_stats)
+        except BinanceError as ex:
+            self.radar_status.value = f"Error al escanear: {ex}"
+            self.radar_status.color = RED
+            self.page.update()
+            return
+        self._last_setups = setups
+        self._render_setups(setups)
+        self.radar_status.value = (
+            f"{len(setups)} oportunidad(es) · {len(symbols)} símbolos escaneados"
+            if setups else
+            "Sin setups claros ahora mismo (mercado sin estructura). Reintenta en unos minutos.")
+        self.radar_status.color = GREEN if setups else GREY
+        self.page.update()
+        if setups:
+            self.page.run_task(self._narrate_setups, setups)
+
+    def _symbol_in_text(self, text: str):
+        """Detecta el primer símbolo válido mencionado en un texto libre."""
+        up = (text or "").upper().replace("?", " ").replace("¿", " ").replace(",", " ")
+        for tok in up.split():
+            cand = tok if tok.endswith("USDT") else tok + "USDT"
+            if cand in self.filters:
+                return cand
+        return None
+
+    async def on_analyze_symbol(self, e=None):
+        """Analiza UN símbolo a pedido (aunque no esté en el top-3) y muestra su
+        tarjeta con 'Preparar orden'. Usa el motor real, no el LLM."""
+        sym = (self.radar_symbol.value or "").strip().upper()
+        if sym and not sym.endswith("USDT"):
+            sym += "USDT"
+        if sym not in self.filters:
+            self.radar_status.value = f"{sym or '—'}: símbolo no válido."
+            self.radar_status.color = RED
+            self.page.update()
+            return
+        self.radar_status.value = f"Analizando {sym}…"
+        self.radar_status.color = GREY
+        self.page.update()
+        cli = self._scan_cli()
+        try:
+            await cli.sync_time()
+            cap = max(self._available_balance, 7.0) * max(1, self._leverage)
+            setup = await scanner.scan_symbol(
+                cli, sym, capacity=cap,
+                min_notional=float(self.filters.get(sym).min_notional),
+                winner_stats=self._winner_stats)
+        except BinanceError as ex:
+            self.radar_status.value = f"Error analizando {sym}: {ex}"
+            self.radar_status.color = RED
+            self.page.update()
+            return
+        if setup:
+            self._last_setups = [setup] + [s for s in self._last_setups if s.symbol != sym]
+            self._render_setups(self._last_setups)
+            self.radar_status.value = (f"{sym}: {setup.side.upper()} · score {setup.score} · "
+                                       f"R:R {setup.rr_net}. Tarjeta arriba con 'Preparar orden'.")
+            self.radar_status.color = GREEN
+        else:
+            self.radar_status.value = (f"{sym}: el motor NO ve un setup válido ahora (sesgo "
+                                       f"neutral o no pasa R:R/gates). No lo recomienda; si "
+                                       f"insistes, opéralo manual en Dashboard bajo tu criterio.")
+            self.radar_status.color = ft.Colors.AMBER
+        self.page.update()
+
+    def _render_setups(self, setups):
+        self.radar_list.controls.clear()
+        for s in setups:
+            is_long = s.side == "long"
+            self.radar_list.controls.append(ft.Container(
+                content=ft.Column([
+                    ft.Row([
+                        ft.Text(s.symbol, weight=ft.FontWeight.BOLD, size=15),
+                        ft.Container(
+                            content=ft.Text("LONG" if is_long else "SHORT", size=10,
+                                            weight=ft.FontWeight.BOLD, color=ft.Colors.WHITE),
+                            bgcolor=ft.Colors.GREEN_700 if is_long else ft.Colors.RED_700,
+                            padding=ft.padding.symmetric(horizontal=8, vertical=2),
+                            border_radius=6),
+                        ft.Container(expand=True),
+                        ft.Text(f"{s.score:g}", weight=ft.FontWeight.BOLD, size=15),
+                    ], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                    ft.ProgressBar(value=max(0.0, min(1.0, s.score / 100)),
+                                   color=ft.Colors.CYAN_300,
+                                   bgcolor=ft.Colors.with_opacity(0.1, ft.Colors.WHITE)),
+                    ft.Text(f"entrada {fmt_price(s.entry_low)}–{fmt_price(s.entry_high)} · "
+                            f"stop {fmt_price(s.stop)} · objetivo {fmt_price(s.target)} · "
+                            f"R:R {s.rr_net}", size=12, color=GREY),
+                    ft.Text(s.reason, size=12, color=GREY),
+                    ft.Row([
+                        ft.OutlinedButton("Ver en gráfico", icon=ft.Icons.SHOW_CHART,
+                                          on_click=self._setup_chart, data=s.symbol),
+                        ft.FilledButton("Preparar orden", icon=ft.Icons.TUNE,
+                                        on_click=self._setup_prepare, data=s),
+                    ], spacing=8),
+                ], spacing=6),
+                padding=12, border_radius=10,
+                bgcolor=ft.Colors.with_opacity(0.04, ft.Colors.WHITE),
+            ))
+
+    async def _setup_chart(self, e):
+        self.chart_symbol.value = e.control.data
+        self.tabs.selected_index = 2  # pestaña Gráfico
+        self.page.update()
+        await self.on_load_chart()
+
+    def _setup_prepare(self, e):
+        """Precarga la orden con RIESGO DEFINIDO (NO ejecuta): margen = fracción del
+        saldo, apalancamiento el más alto que deje la liquidación fuera del SL, y
+        aislado. Tú revisas y pulsas LONG/SHORT."""
+        s = e.control.data
+        entry = s.entry_high if s.side == "long" else s.entry_low
+        if not entry or s.symbol not in self.filters:
+            self._snack(f"{s.symbol}: no puedo dimensionar (símbolo/entrada inválidos).",
+                        error=True)
+            return
+        stop_pct = abs(entry - s.stop) / entry * 100.0
+        tp_pct = abs(s.target - entry) / entry * 100.0
+        sl_frac = stop_pct / 100.0
+
+        avail = self._available_balance or 6.95
+        sf = self.filters.get(s.symbol)
+        cap = int(self.risk.limits.max_leverage)
+        sz = sg.safe_sizing(avail, sl_frac, float(sf.min_notional),
+                            risk_frac=RADAR_RISK_FRAC, max_leverage=cap,
+                            buffer=LEV_SAFETY_BUFFER)
+        margin, lev, notional = sz["margin"], sz["leverage"], sz["notional"]
+        notional = min(notional, avail * lev, float(self.risk.limits.max_position_notional))
+        warn = (" ⚠ SL ancho: liquidación más cerca de lo ideal; considera saltarlo."
+                if sz["sl_wide"] else "")
+
+        self.symbol_field.value = s.symbol
+        self.auto_switch.value = False
+        self.stop_field.value = f"{stop_pct:.2f}"
+        self.tp_field.value = f"{tp_pct:.2f}"
+        self._leverage = lev
+        self.leverage_slider.value = lev
+        self.leverage_label.value = f"{lev}x"
+        self._update_symbol_hint()
+        self._recompute_notional_range()
+        self._set_notional(notional)
+        self.tabs.selected_index = 0  # Dashboard
+        side_txt = "LONG" if s.side == "long" else "SHORT"
+        self._snack(f"{s.symbol} {side_txt}: margen ~{fmt_usd(margin)} × {lev}x = "
+                    f"{fmt_usd(notional)} · aislado · TP {tp_pct:.2f}% / SL {stop_pct:.2f}%. "
+                    f"Revisa y pulsa {side_txt}." + warn)
+        self.page.update()
+
+    def _setups_context(self, setups) -> str:
+        if not setups:
+            return "Ahora mismo no hay setups en el radar."
+        lines = [
+            f"- {s.symbol} {s.side.upper()} score {s.score}: entrada "
+            f"{fmt_price(s.entry_low)}–{fmt_price(s.entry_high)}, stop {fmt_price(s.stop)}, "
+            f"objetivo {fmt_price(s.target)}, R:R {s.rr_net}. {s.reason}"
+            for s in setups
+        ]
+        return "Setups actuales del radar:\n" + "\n".join(lines)
+
+    async def _narrate_setups(self, setups):
+        txt = await llm_mod.narrate(
+            self._setups_context(setups) +
+            "\n\nResume en 2-3 frases cuál se ve mejor y qué vigilar. No prometas nada.")
+        if txt:
+            self.radar_chat_out.value = txt
+            self.page.update()
+
+    async def on_radar_chat(self, e=None):
+        q = (self.radar_chat_input.value or "").strip()
+        if not q:
+            return
+        self.radar_chat_out.value = "Pensando…"
+        self.page.update()
+        context = self._setups_context(self._last_setups)
+        sym = self._symbol_in_text(q)
+        if sym:  # ancla el chat al MOTOR real para ese símbolo (nada de inventar)
+            try:
+                cli = self._scan_cli()
+                await cli.sync_time()
+                cap = max(self._available_balance, 7.0) * max(1, self._leverage)
+                st = await scanner.scan_symbol(
+                    cli, sym, capacity=cap,
+                    min_notional=float(self.filters.get(sym).min_notional),
+                    winner_stats=self._winner_stats)
+                context += (f"\n\nMotor para {sym}: {self._setups_context([st])}" if st else
+                            f"\n\nEl motor NO ve setup válido para {sym} ahora; NO inventes "
+                            f"precios para {sym}.")
+            except BinanceError:
+                pass
+        txt = await llm_mod.narrate(
+            f"{context}\n\nPregunta del trader: {q}\n\nUsa SOLO los números del motor; "
+            f"si no hay setup para el símbolo, dilo y no inventes cifras.")
+        self.radar_chat_out.value = txt or (
+            "LLM local no disponible. Inicia Ollama en el Mac (ollama serve) o usa "
+            "el botón Analizar.")
+        self.page.update()
+
     # --- Limpieza -------------------------------------------------------------
     async def shutdown(self):
         for s in (self._user_stream, self._mark_stream, self._chart_stream):
@@ -1353,6 +1640,8 @@ class TradingApp(ft.Column):
             self._fallback_task.cancel()
         if self._spot is not None:
             await self._spot.close()
+        if self._scan_client is not None:
+            await self._scan_client.close()
         await self.client.close()
 
 
@@ -1449,6 +1738,9 @@ async def main(page: ft.Page):
 if __name__ == "__main__":
     _port = os.getenv("PORT")
     if _port:  # despliegue web (Render define PORT)
-        ft.app(target=main, view=None, host="0.0.0.0", port=int(_port))
+        # FLET_WEB_RENDERER=html permite automatizar la UI (DOM real vs canvas).
+        _renderer = os.getenv("FLET_WEB_RENDERER")
+        _kw = {"web_renderer": ft.WebRenderer(_renderer)} if _renderer else {}
+        ft.app(target=main, view=None, host="0.0.0.0", port=int(_port), **_kw)
     else:      # uso local de siempre (desktop)
         ft.app(target=main)

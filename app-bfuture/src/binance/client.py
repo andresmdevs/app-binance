@@ -307,6 +307,47 @@ class BinanceFuturesClient:
         """Mejor bid/ask actuales (para colocar entradas maker)."""
         return await self._request("GET", "/fapi/v1/ticker/bookTicker", {"symbol": symbol})
 
+    async def depth(self, symbol: str, limit: int = 500) -> dict:
+        """Libro de órdenes (muros de liquidez reales). Peso: 5,10,20 según limit
+        (limit 500 -> peso 10, 1000 -> peso 20). limit válido: 5,10,20,50,100,500,1000.
+        """
+        return await self._request("GET", "/fapi/v1/depth",
+                                   {"symbol": symbol, "limit": limit})
+
+    async def open_interest(self, symbol: str) -> dict:
+        """Interés abierto ACTUAL del símbolo. Peso 1."""
+        return await self._request("GET", "/fapi/v1/openInterest", {"symbol": symbol})
+
+    # --- Datos de mercado agregados (/futures/data/*) ------------------------
+    # OJO: estos endpoints SOLO existen en mainnet (fapi.binance.com); en testnet
+    # devuelven 404. Son públicos (sin firma). period válido: 5m,15m,30m,1h,2h,4h,
+    # 6h,12h,1d. limit por defecto 30, máx 500.
+    async def open_interest_hist(self, symbol: str, period: str = "5m",
+                                 limit: int = 30, **kw) -> list:
+        """Histórico de interés abierto (tendencia del OI). Solo mainnet."""
+        params = {"symbol": symbol, "period": period, "limit": limit, **kw}
+        return await self._request("GET", "/futures/data/openInterestHist", params)
+
+    async def long_short_account_ratio(self, symbol: str, period: str = "5m",
+                                       limit: int = 30, **kw) -> list:
+        """Ratio long/short de cuentas (posicionamiento retail). Solo mainnet."""
+        params = {"symbol": symbol, "period": period, "limit": limit, **kw}
+        return await self._request(
+            "GET", "/futures/data/globalLongShortAccountRatio", params)
+
+    async def top_long_short_position_ratio(self, symbol: str, period: str = "5m",
+                                            limit: int = 30, **kw) -> list:
+        """Ratio long/short de las posiciones de grandes traders. Solo mainnet."""
+        params = {"symbol": symbol, "period": period, "limit": limit, **kw}
+        return await self._request(
+            "GET", "/futures/data/topLongShortPositionRatio", params)
+
+    async def taker_long_short_ratio(self, symbol: str, period: str = "5m",
+                                     limit: int = 30, **kw) -> list:
+        """Ratio de volumen taker comprador/vendedor (presión agresiva). Solo mainnet."""
+        params = {"symbol": symbol, "period": period, "limit": limit, **kw}
+        return await self._request("GET", "/futures/data/takerlongshortRatio", params)
+
     # --- User Data Stream (USER_STREAM: solo header API-key, sin firma) -------
     async def create_listen_key(self) -> str:
         data = await self._request("POST", "/fapi/v1/listenKey")
