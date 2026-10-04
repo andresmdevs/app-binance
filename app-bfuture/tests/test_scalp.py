@@ -51,3 +51,15 @@ def test_open_scalp_maker_uses_limit_gtx(filters, make_fake_client):
     # bracket TP+SL colocado tras el fill
     algos = c.find("POST", "/fapi/v1/algoOrder")
     assert sorted(a["params"]["type"] for a in algos) == ["STOP_MARKET", "TAKE_PROFIT_MARKET"]
+
+
+def test_open_scalp_preconfigured_skips_account_calls(filters, make_fake_client):
+    """El motor autónomo fija margen/apalancamiento antes de la vela: en el
+    instante de entrar solo deben salir la orden y el bracket."""
+    c = make_fake_client(mark="60000")
+    cfg = ScalpConfig(notional=Decimal("120"), take_profit_pct=0.01, stop_loss_pct=0.005,
+                      leverage=10, preconfigured=True)
+    run(open_scalp(FuturesTrader(c, filters), c, symbol="BTCUSDT", side="BUY", config=cfg))
+    assert not c.find("POST", "/fapi/v1/leverage")
+    assert not c.find("POST", "/fapi/v1/marginType")
+    assert c.find("POST", "/fapi/v1/order")

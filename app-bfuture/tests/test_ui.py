@@ -70,3 +70,43 @@ def test_notional_range_uses_symbol_min_and_clamps():
     assert float(app.notional_field.value) == app.notional_slider.max
     app._set_notional(0)                             # por debajo del mínimo
     assert float(app.notional_field.value) == app.notional_slider.min
+
+
+# --- Pestaña Auto (motor autónomo) --------------------------------------------
+import pytest  # noqa: E402
+
+from binance.engine import AutoEngine  # noqa: E402
+
+
+def test_auto_tab_present_and_config_parses():
+    app = _app()
+    assert "Auto" in [t.text for t in app.tabs.tabs]
+    app.auto_symbols.value = "sol, doge;BTCUSDT"
+    app.auto_margin.value = "3"
+    app.auto_lev.value = "4"
+    app.auto_min_score.value = "3"
+    app.auto_maker.value = True
+    cfg = app._auto_config()
+    assert cfg.mode == "candle" and cfg.symbols == ["SOLUSDT", "DOGEUSDT", "BTCUSDT"]
+    assert str(cfg.margin_usdt) == "3" and cfg.leverage == 4 and cfg.lead_s == 4.0
+    assert cfg.signal.min_score == 3 and cfg.entry_type == "MAKER"
+    assert cfg.signal.fee_rt == pytest.approx(0.0007)
+    app.auto_mode.value = "radar"
+    assert app._auto_config().mode == "radar"
+
+
+def test_auto_config_rejects_bad_numbers():
+    app = _app()
+    app.auto_margin.value = "abc"
+    with pytest.raises(ValueError):
+        app._auto_config()
+
+
+def test_auto_feed_and_stats_render():
+    app = _app()
+    app._engine = AutoEngine(app.client, app.trader, app.risk)
+    app._engine.stats.record(0.25, 0.01)
+    app._on_engine_event({"ts": 1_700_000_000_000, "kind": "close",
+                          "msg": "BTCUSDT LONG cerrada", "net": 0.25})
+    assert len(app.auto_feed.controls) == 1
+    assert "ganadas 1" in app.auto_stats.value

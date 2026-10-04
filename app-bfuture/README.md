@@ -25,6 +25,20 @@ La app necesita una API key de Binance **Futures** con permisos de *Reading + Fu
 > distribuible. El `.env` vive en la raíz del proyecto (fuera del bundle `src/`) y está
 > en `.gitignore`.
 
+## Motor autónomo (testnet)
+
+Pestaña **Auto**: analiza unos segundos antes de cada vela (cada indicador vota) y
+ejecuta al abrirla, con TP/SL en el exchange, salida por tiempo, kill-switch y pausa
+por racha de pérdidas. También ejecuta las señales del **Radar** sin intervención.
+Solo opera en testnet. Antes de usarlo, mide las reglas sobre histórico real:
+
+```bash
+PYTHONPATH=src uv run python -m binance.autotrader replay --symbols BTCUSDT SOLUSDT --days 7
+PYTHONPATH=src uv run python -m binance.autotrader run --symbols SOLUSDT --minutes 60
+```
+
+Detalles en [`docs/AUTOTRADER.md`](docs/AUTOTRADER.md).
+
 ## Despliegue en Render (acceso desde iPhone)
 
 La app puede servirse como web app en [Render](https://render.com) usando el

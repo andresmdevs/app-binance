@@ -14,7 +14,7 @@ from .client import (
 )
 from .audit import AuditLog
 from .filters import FilterCache, FilterError, SymbolFilters
-from .risk import RiskError, RiskLimits, RiskManager
+from .risk import KillSwitchError, RiskError, RiskLimits, RiskManager
 from .scalp import (ScalpConfig, bracket_prices, close_scalp,
                     manage_trailing_stop, open_scalp)
 from .trade import FuturesTrader, new_client_order_id
@@ -37,6 +37,7 @@ __all__ = [
     "RiskManager",
     "RiskLimits",
     "RiskError",
+    "KillSwitchError",
     "AuditLog",
     "ScalpConfig",
     "open_scalp",

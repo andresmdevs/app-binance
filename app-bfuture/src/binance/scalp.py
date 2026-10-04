@@ -36,6 +36,10 @@ class ScalpConfig:
     entry_type: str = "MARKET"     # "MARKET" (taker) | "MAKER" (LIMIT GTX = post-only)
     entry_timeout_s: int = 30      # tiempo de espera del fill maker antes de cancelar
     margin_type: str = "ISOLATED"  # "ISOLATED" (pérdida capada al margen) | "CROSSED"
+    # True = el llamador ya fijó margen y apalancamiento del símbolo (p.ej. el motor
+    # autónomo, durante los segundos previos a la vela) -> no se repiten 2 llamadas
+    # firmadas justo en el instante de la entrada.
+    preconfigured: bool = False
 
 
 async def _wait_position(client, symbol: str, *, attempts: int = 8, delay: float = 0.4) -> bool:
@@ -122,12 +126,13 @@ async def open_scalp(
 
     is_market = config.entry_type.upper() != "MAKER"
     qty = sf.format_qty(config.notional / mark, market=is_market)
-    if config.margin_type:
-        try:
-            await trader.set_margin_type(symbol, config.margin_type)
-        except BinanceAPIError:
-            pass  # ya está así / no cambiable con posición abierta; no bloquea la entrada
-    await trader.set_leverage(symbol, config.leverage)
+    if not config.preconfigured:
+        if config.margin_type:
+            try:
+                await trader.set_margin_type(symbol, config.margin_type)
+            except BinanceAPIError:
+                pass  # ya está así / no cambiable con posición abierta; no bloquea la entrada
+        await trader.set_leverage(symbol, config.leverage)
 
     if is_market:
         entry = await trader.market(symbol, side, qty, mark_price=mark)
@@ -180,7 +185,8 @@ async def manage_trailing_stop(
     deadline = time.time() + max_hold_seconds
 
     while time.time() < deadline:
-        await asyncio.sleep(poll_seconds)
+        # Nunca dormir más allá del deadline: el cierre por tiempo cae en su segundo.
+        await asyncio.sleep(max(0.0, min(poll_seconds, deadline - time.time())))
         positions = [p for p in await client.position_risk(symbol)
                      if float(p.get("positionAmt", 0)) != 0]
         if not positions:

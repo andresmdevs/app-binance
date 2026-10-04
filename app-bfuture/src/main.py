@@ -5,6 +5,9 @@ UI reactiva sobre la capa `binance/`:
   * Órdenes    -> órdenes abiertas reales + cancelar.
   * Gráfico    -> klines por REST + línea de precio EN VIVO por WebSocket.
   * Historial  -> PnL realizado con filtros (símbolo, días, solo positivo, min PnL).
+  * Radar      -> motor de señales (semi-automático: tú confirmas).
+  * Auto       -> motor AUTÓNOMO (solo testnet): analiza N s antes de cada vela y
+                  ejecuta al abrirla, con TP/SL, salida por tiempo y paradas de riesgo.
 
 Monitoreo EN VIVO por WebSocket (hito 4): con "Auto-actualizar" se abre el user
 data stream (refresca por eventos, sin polling agresivo) y un stream de markPrice
@@ -19,6 +22,7 @@ import hashlib
 import hmac as _hmac
 import os
 import secrets as _secrets
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
@@ -33,7 +37,6 @@ from binance import (
     FuturesTrader,
     MarketStream,
     RiskError,
-    RiskLimits,
     RiskManager,
     ScalpConfig,
     UserStream,
@@ -49,7 +52,10 @@ from binance import pnl as pnl_mod
 from binance import scanner
 from binance import signals as sg
 from binance.autoscalp import auto_levels, momentum_ok
+from binance.autosignal import SignalConfig
+from binance.engine import AutoEngine, EngineConfig, EngineError, radar_config
 from binance.forwardtest import select_candidates
+from binance.risk import limits_from_env
 
 # --- Configuración / credenciales --------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent.parent  # .../app-bfuture
@@ -72,22 +78,8 @@ FALLBACK_POLL_SECONDS = 30  # respaldo por si el WS cae
 CHART_POINTS = 200
 
 
-def _env_dec(name: str, default) -> Decimal:
-    v = os.getenv(name)
-    try:
-        return Decimal(v) if v else Decimal(str(default))
-    except Exception:
-        return Decimal(str(default))
-
-
-# Guardas de riesgo (configurables por entorno).
-RISK_LIMITS = RiskLimits(
-    max_order_notional=_env_dec("RISK_MAX_ORDER_NOTIONAL", 1000),
-    max_position_notional=_env_dec("RISK_MAX_POSITION_NOTIONAL", 5000),
-    max_open_positions=int(os.getenv("RISK_MAX_OPEN_POSITIONS", "5")),
-    max_leverage=int(os.getenv("RISK_MAX_LEVERAGE", "10")),
-    daily_loss_limit=_env_dec("RISK_DAILY_LOSS_LIMIT", 100),
-)
+# Guardas de riesgo (configurables por entorno; mismas que usa el CLI del motor).
+RISK_LIMITS = limits_from_env()
 DEFAULT_STOP_PCT = float(os.getenv("ENTRY_STOP_PCT", "2"))   # % de stop por defecto
 DEFAULT_TP_PCT = float(os.getenv("ENTRY_TP_PCT", "1"))       # % take-profit por defecto
 DEFAULT_MAX_HOLD_MIN = float(os.getenv("SCALP_MAX_HOLD_MIN", "5"))  # cierre por tiempo
@@ -104,6 +96,17 @@ TRAIL_PCT = float(os.getenv("TRAIL_PCT", "0.005"))           # trailing del stop
 # --- Radar: dimensionado de riesgo definido (plan acordado) ---
 RADAR_RISK_FRAC = float(os.getenv("RADAR_RISK_FRAC", "0.10"))  # margen = % del disponible (~$0.69)
 LEV_SAFETY_BUFFER = 1.6  # la liquidación debe quedar más lejos que el SL × este buffer
+
+# --- Auto: motor autónomo (valores iniciales de la pestaña) ---
+AUTO_ENGINE_SYMBOLS = os.getenv("AUTO_ENGINE_SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT")
+AUTO_ENGINE_MARGIN = os.getenv("AUTO_ENGINE_MARGIN", "5")
+try:
+    AUTO_ENGINE_LEVERAGE = int(os.getenv("AUTO_ENGINE_LEVERAGE", "5"))
+except ValueError:
+    AUTO_ENGINE_LEVERAGE = 5
+AUTO_FEED_MAX = 150
+AUTO_ICONS = {"skip": "·", "open": "▶", "close": "■", "error": "!", "halt": "⛔",
+              "status": "»", "stopped": "⏹"}
 
 GREEN = ft.Colors.GREEN_ACCENT_400
 RED = ft.Colors.RED_ACCENT_200
@@ -172,6 +175,10 @@ class TradingApp(ft.Column):
         self._scan_client = None
         self._last_setups = []
         self._winner_stats = None  # perfil de ganadoras (de analyzeprod); se carga aparte
+
+        # Estado del motor autónomo (pestaña Auto).
+        self._engine = None
+        self._auto_ticker_task = None
 
         # --- Cabecera --------------------------------------------------------
         self.env_badge = ft.Container(
@@ -475,6 +482,8 @@ class TradingApp(ft.Column):
             padding=16, expand=True,
         )
 
+        auto_tab = self._build_auto_tab()
+
         self.tabs = ft.Tabs(
             selected_index=0, animation_duration=250, expand=True,
             tabs=[
@@ -484,6 +493,7 @@ class TradingApp(ft.Column):
                 ft.Tab(text="Historial", icon=ft.Icons.HISTORY_ROUNDED, content=history_tab),
                 ft.Tab(text="Earn", icon=ft.Icons.SAVINGS_ROUNDED, content=earn_tab),
                 ft.Tab(text="Radar", icon=ft.Icons.RADAR, content=radar_tab),
+                ft.Tab(text="Auto", icon=ft.Icons.SMART_TOY_OUTLINED, content=auto_tab),
             ],
         )
         self.controls = [
@@ -705,7 +715,7 @@ class TradingApp(ft.Column):
             self._set_status(f"Error: {e}", RED)
         # Modo demo (RADAR_DEMO=1): abre en la pestaña Radar y escanea al iniciar.
         if os.getenv("RADAR_DEMO"):
-            self.tabs.selected_index = len(self.tabs.tabs) - 1
+            self.tabs.selected_index = [t.text for t in self.tabs.tabs].index("Radar")
             self.page.update()
             await self.on_scan()
 
@@ -1631,8 +1641,251 @@ class TradingApp(ft.Column):
             "el botón Analizar.")
         self.page.update()
 
+    # --- Auto: motor autónomo -------------------------------------------------
+    def _build_auto_tab(self) -> ft.Container:
+        def num(label, value, suffix, width=112):
+            return ft.TextField(label=label, value=str(value), width=width, dense=True,
+                                text_size=13, suffix_text=suffix,
+                                keyboard_type=ft.KeyboardType.NUMBER)
+
+        self.auto_mode = ft.Dropdown(
+            label="Modo", width=170, value="candle", dense=True,
+            options=[ft.dropdown.Option("candle", "Vela (votos)"),
+                     ft.dropdown.Option("radar", "Radar (señales)")])
+        self.auto_symbols = ft.TextField(
+            label="Símbolos (separados por coma)", value=AUTO_ENGINE_SYMBOLS, dense=True,
+            text_size=13, expand=True, capitalization=ft.TextCapitalization.CHARACTERS,
+            helper_text="en Radar, vacío = top 20 más líquidos")
+        self.auto_interval = ft.Dropdown(
+            label="Vela", width=90, value="1m", dense=True,
+            options=[ft.dropdown.Option(i) for i in ("1m", "3m", "5m", "15m")])
+        self.auto_lead = num("Analiza antes", 4, "s")
+        self.auto_margin = num("Margen/orden", AUTO_ENGINE_MARGIN, "USDT", 130)
+        self.auto_lev = num("Apalanc. máx", min(AUTO_ENGINE_LEVERAGE,
+                                                RISK_LIMITS.max_leverage), "x")
+        self.auto_hold = num("Duración", 1, "velas")
+        self.auto_min_score = ft.Dropdown(
+            label="Votos mín.", width=110, value="2", dense=True,
+            options=[ft.dropdown.Option(str(n)) for n in range(1, 6)])
+        self.auto_tp = num("TP", 1.5, "×ATR", 100)
+        self.auto_sl = num("SL", 1.0, "×ATR", 100)
+        self.auto_max_trades = num("Máx órdenes", 30, "", 110)
+        self.auto_max_losses = num("Pausa tras", 4, "pérdidas", 140)
+        self.auto_trailing = ft.Switch(label="Trailing (break-even + seguir)", value=False,
+                                       adaptive=True)
+        self.auto_maker = ft.Switch(label="Entrada maker (menos comisión, puede no llenar)",
+                                    value=False, adaptive=True)
+        self.auto_start_btn = ft.FilledButton(
+            "Arrancar", icon=ft.Icons.PLAY_ARROW, on_click=self.on_auto_start,
+            disabled=not TESTNET)
+        self.auto_stop_btn = ft.OutlinedButton(
+            "Detener", icon=ft.Icons.PAUSE, on_click=self.on_auto_stop, disabled=True)
+        self.auto_stop_close_btn = ft.OutlinedButton(
+            "Detener y cerrar posiciones", icon=ft.Icons.STOP_CIRCLE_OUTLINED,
+            on_click=self.on_auto_stop_close, disabled=True)
+        self.auto_status = ft.Text(
+            "Motor detenido." if TESTNET else
+            "Bloqueado: el motor autónomo solo opera en TESTNET (BINANCE_TESTNET=true).",
+            size=13, color=GREY if TESTNET else RED)
+        self.auto_stats = ft.Text("", size=12, color=GREY)
+        self.auto_feed = ft.ListView(spacing=2, height=320)
+        self.auto_shadow = ft.Column(spacing=2, tight=True)
+        return ft.Container(
+            content=ft.Column([
+                ft.Row([
+                    ft.Text("Motor autónomo", weight=ft.FontWeight.BOLD),
+                    ft.Container(
+                        content=ft.Text("solo TESTNET", size=10, weight=ft.FontWeight.BOLD,
+                                        color=ft.Colors.BLACK),
+                        bgcolor=ft.Colors.AMBER_400, border_radius=6,
+                        padding=ft.padding.symmetric(horizontal=8, vertical=2)),
+                ], vertical_alignment=ft.CrossAxisAlignment.CENTER),
+                ft.Text("Como el modo autónomo de Exnova: analiza unos segundos antes de "
+                        "cada vela (cada indicador vota) y ejecuta al abrirla. Cada orden "
+                        "lleva TP/SL en el exchange y salida por tiempo. Sin martingala: "
+                        "tamaño fijo, pausa tras una racha de pérdidas y kill-switch "
+                        "diario.", size=11, color=GREY),
+                ft.Row([self.auto_mode, self.auto_interval, self.auto_symbols],
+                       spacing=8, vertical_alignment=ft.CrossAxisAlignment.START),
+                ft.Row([self.auto_margin, self.auto_lev, self.auto_hold, self.auto_lead],
+                       spacing=8, wrap=True),
+                ft.Row([self.auto_min_score, self.auto_tp, self.auto_sl,
+                        self.auto_max_trades, self.auto_max_losses], spacing=8, wrap=True),
+                ft.Row([self.auto_trailing, self.auto_maker], spacing=12, wrap=True),
+                ft.Row([self.auto_start_btn, self.auto_stop_btn, self.auto_stop_close_btn],
+                       spacing=8, wrap=True),
+                self.auto_status,
+                self.auto_stats,
+                ft.Divider(height=8),
+                ft.Text("Actividad (lo más reciente arriba)", size=12, color=GREY,
+                        weight=ft.FontWeight.BOLD),
+                self.auto_feed,
+                ft.Divider(height=8),
+                ft.Text("Marcador en sombra · ¿acierta cada indicador la dirección de la "
+                        "vela siguiente? (todas las velas, operadas o no)", size=12,
+                        color=GREY, weight=ft.FontWeight.BOLD),
+                self.auto_shadow,
+            ], spacing=10, scroll=ft.ScrollMode.AUTO),
+            padding=16, expand=True,
+        )
+
+    def _auto_config(self) -> EngineConfig:
+        """Lee los controles de la pestaña Auto. ValueError con mensaje si algo falla."""
+        raw = (self.auto_symbols.value or "").replace(";", ",").replace(" ", ",")
+        syms = [x.strip().upper() for x in raw.split(",") if x.strip()]
+        syms = [x if x.endswith("USDT") else x + "USDT" for x in syms]
+        try:
+            margin = Decimal(str(self.auto_margin.value).strip())
+            lev = int(float(self.auto_lev.value))
+            hold = int(float(self.auto_hold.value))
+            lead = float(self.auto_lead.value)
+            tp = float(self.auto_tp.value)
+            sl = float(self.auto_sl.value)
+            max_trades = int(float(self.auto_max_trades.value))
+            max_losses = int(float(self.auto_max_losses.value))
+            min_score = int(self.auto_min_score.value or "2")
+        except Exception:
+            raise ValueError("Revisa los valores numéricos del motor.")
+        if tp <= 0 or sl <= 0 or max_trades < 1 or max_losses < 1:
+            raise ValueError("TP, SL, máx. órdenes y pausa deben ser mayores que 0.")
+        maker = bool(self.auto_maker.value)
+        sig = SignalConfig(min_score=min_score, tp_atr=tp, sl_atr=sl,
+                           fee_rt=0.0007 if maker else 0.001)  # maker 0.02% + taker 0.05%
+        common = dict(margin_usdt=margin, leverage=min(lev, RISK_LIMITS.max_leverage),
+                      max_trades=max_trades, max_consecutive_losses=max_losses,
+                      entry_type="MAKER" if maker else "MARKET",
+                      trailing=bool(self.auto_trailing.value), signal=sig)
+        if (self.auto_mode.value or "candle") == "radar":
+            return radar_config(symbols=syms, **common)
+        return EngineConfig(symbols=syms, interval=self.auto_interval.value or "1m",
+                            lead_s=lead, hold_candles=hold, **common)
+
+    def _auto_buttons(self, running: bool):
+        self.auto_start_btn.disabled = running or not TESTNET
+        self.auto_stop_btn.disabled = not running
+        self.auto_stop_close_btn.disabled = not running
+
+    async def on_auto_start(self, e=None):
+        if self._engine is not None and self._engine.running:
+            return
+        if not TESTNET:
+            self._snack("El motor autónomo solo opera en TESTNET.", error=True)
+            return
+        try:
+            cfg = self._auto_config()
+        except ValueError as ex:
+            self._snack(str(ex), error=True)
+            return
+        eng = AutoEngine(
+            self.client, self.trader, self.risk, cfg,
+            scan_client=self._scan_cli() if cfg.mode == "radar" else None,
+            journal=AuditLog(PROJECT_ROOT / "logs" / "autotrader.jsonl"),
+            on_event=self._on_engine_event)
+        try:
+            eng.start()
+        except EngineError as ex:
+            self.auto_status.value = f"No arranca: {ex}"
+            self.auto_status.color = RED
+            self.page.update()
+            return
+        self._engine = eng
+        self.auto_feed.controls.clear()
+        self._auto_buttons(running=True)
+        if self._auto_ticker_task is None or self._auto_ticker_task.done():
+            self._auto_ticker_task = asyncio.create_task(self._auto_ticker())
+        self._render_auto()
+        self.page.update()
+
+    async def on_auto_stop(self, e=None):
+        if self._engine is not None:
+            await self._engine.stop()
+            self._render_auto()
+            self.page.update()
+
+    async def on_auto_stop_close(self, e=None):
+        if self._engine is None:
+            return
+        n = len(self._engine.open_trades)
+        if n and not await self._confirm(
+                "Detener y cerrar", f"Se cerrarán a mercado {n} posición(es) del motor."):
+            return
+        await self._engine.stop(close_positions=True)
+        self._render_auto()
+        self.page.update()
+
+    def _on_engine_event(self, evt: dict):
+        colors = {"open": ft.Colors.CYAN_200, "error": RED, "halt": ft.Colors.AMBER,
+                  "status": ft.Colors.PRIMARY, "stopped": ft.Colors.AMBER}
+        color = colors.get(evt["kind"], GREY)
+        if evt["kind"] == "close" and evt.get("net") is not None:
+            color = pnl_color(evt["net"])
+        ts = datetime.fromtimestamp(evt["ts"] / 1000).strftime("%H:%M:%S")
+        self.auto_feed.controls.insert(0, ft.Text(
+            f"{ts} {AUTO_ICONS.get(evt['kind'], ' ')} {evt['msg']}", size=12,
+            color=color, selectable=True))
+        del self.auto_feed.controls[AUTO_FEED_MAX:]
+        self._render_auto()
+        self.page.update()
+
+    def _render_auto(self):
+        eng = self._engine
+        if eng is None:
+            return
+        if eng.running:
+            nxt = eng.next_tick_ms
+            when = ""
+            if nxt:
+                secs = max(0, int((nxt - eng.cfg.lead_s * 1000 - eng._clock()) / 1000))
+                when = f" · próximo análisis en {secs}s"
+            self.auto_status.value = f"En marcha · {eng.describe()}{when}"
+            self.auto_status.color = GREEN
+        else:
+            live = f" · {len(eng.open_trades)} orden(es) aún supervisada(s)" \
+                if eng.open_trades else ""
+            self.auto_status.value = f"Detenido: {eng.paused_reason or 'fin'}{live}"
+            self.auto_status.color = ft.Colors.AMBER if eng.paused_reason else GREY
+        st = eng.stats
+        wr = "—" if st.win_rate is None else f"{st.win_rate * 100:.0f}%"
+        self.auto_stats.value = (
+            f"Órdenes {st.opened} · vivas {len(eng.open_trades)} · ganadas {st.wins} / "
+            f"perdidas {st.losses} ({wr}) · neto {st.net:+.4f} USDT · comisiones "
+            f"{st.commission:.4f} · racha {st.consec_losses} (peor {st.max_consec_losses})")
+        self.auto_stats.color = pnl_color(st.net) if st.closed else GREY
+        self.auto_shadow.controls = [
+            ft.Text(f"{r['label']:<22} {r['rate'] * 100:5.1f}%  "
+                    f"[{r['lo'] * 100:.0f}–{r['hi'] * 100:.0f}%]  n={r['total']}",
+                    size=12, color=GREY, font_family="monospace")
+            for r in eng.shadow.ranking() if r["total"]
+        ] or [ft.Text("Aún sin velas resueltas (tarda ~2 velas en empezar).", size=12,
+                      color=GREY)]
+        self._auto_buttons(running=eng.running)
+
+    async def _auto_ticker(self):
+        """Refresca la cuenta atrás mientras el motor vive o tenga órdenes abiertas."""
+        while self._engine is not None and (self._engine.running or self._engine.open_trades):
+            self._render_auto()
+            try:
+                self.page.update()
+            except Exception:  # noqa: BLE001 - página cerrada
+                return
+            await asyncio.sleep(1)
+        self._render_auto()
+        try:
+            self.page.update()
+        except Exception:  # noqa: BLE001
+            pass
+
     # --- Limpieza -------------------------------------------------------------
     async def shutdown(self):
+        if self._engine is not None:
+            # Sin la app no hay quien haga el cierre por tiempo: el motor cierra lo suyo.
+            await self._engine.stop(close_positions=True, reason="app cerrada")
+            try:
+                await asyncio.wait_for(self._engine.join(), timeout=15)
+            except asyncio.TimeoutError:
+                pass
+        if self._auto_ticker_task:
+            self._auto_ticker_task.cancel()
         for s in (self._user_stream, self._mark_stream, self._chart_stream):
             if s:
                 await s.stop()

@@ -9,6 +9,7 @@ manager solo reúne el estado (posiciones + PnL realizado del día) y la invoca.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from datetime import datetime, time, timezone
 from decimal import Decimal
@@ -19,6 +20,14 @@ class RiskError(Exception):
     """Una guarda de riesgo bloqueó la operación."""
 
 
+class KillSwitchError(RiskError):
+    """La pérdida diaria alcanzó el límite: no se abre NADA más hoy.
+
+    Subclase de RiskError (quien ya captura RiskError sigue funcionando); un bot
+    autónomo la distingue para DETENERSE en vez de solo saltar la señal.
+    """
+
+
 @dataclass
 class RiskLimits:
     max_order_notional: Decimal = Decimal("1000")     # tamaño máx por orden
@@ -26,6 +35,25 @@ class RiskLimits:
     max_open_positions: int = 5                        # nº máx de posiciones a la vez
     max_leverage: int = 10                             # tope de apalancamiento
     daily_loss_limit: Decimal = Decimal("100")         # kill-switch: pérdida diaria
+
+
+def _env_dec(name: str, default) -> Decimal:
+    v = os.getenv(name)
+    try:
+        return Decimal(v) if v else Decimal(str(default))
+    except Exception:
+        return Decimal(str(default))
+
+
+def limits_from_env() -> RiskLimits:
+    """Límites desde variables de entorno (mismos nombres que `.env.example`)."""
+    return RiskLimits(
+        max_order_notional=_env_dec("RISK_MAX_ORDER_NOTIONAL", 1000),
+        max_position_notional=_env_dec("RISK_MAX_POSITION_NOTIONAL", 5000),
+        max_open_positions=int(os.getenv("RISK_MAX_OPEN_POSITIONS", "5")),
+        max_leverage=int(os.getenv("RISK_MAX_LEVERAGE", "10")),
+        daily_loss_limit=_env_dec("RISK_DAILY_LOSS_LIMIT", 100),
+    )
 
 
 def evaluate_open(
@@ -69,7 +97,8 @@ class RiskManager:
         return sum((Decimal(str(r.get("income", 0))) for r in rows), Decimal("0"))
 
     async def check_open(self, symbol: str, order_notional) -> None:
-        """Valida una apertura. Lanza RiskError si viola alguna guarda."""
+        """Valida una apertura. Lanza RiskError si viola alguna guarda
+        (KillSwitchError si es por la pérdida diaria)."""
         order_notional = Decimal(str(order_notional))
         positions = await self.client.position_risk()
         open_symbols = set()
@@ -86,4 +115,6 @@ class RiskManager:
             open_symbols=open_symbols, symbol_notional=symbol_notional,
             daily_realized=daily)
         if msg:
+            if daily <= -self.limits.daily_loss_limit:
+                raise KillSwitchError(msg)
             raise RiskError(msg)

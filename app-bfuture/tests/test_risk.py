@@ -34,3 +34,43 @@ def test_existing_symbol_not_blocked_when_full():
 def test_exposure_cap():
     assert evaluate_open(L, order_notional=Decimal("100"),
                          **{**BASE, "symbol_notional": Decimal("4950")})
+
+
+# --- RiskManager: el kill-switch se distingue del resto de bloqueos ----------
+import asyncio
+
+import pytest
+
+from binance.risk import KillSwitchError, RiskError, RiskManager
+
+
+class _Acct:
+    def __init__(self, daily):
+        self.daily = daily
+
+    async def position_risk(self, symbol=None):
+        return []
+
+    async def income(self, **kw):
+        return [{"income": str(self.daily)}]
+
+
+def test_check_open_raises_kill_switch_subclass():
+    rm = RiskManager(_Acct(-150), L)
+    with pytest.raises(KillSwitchError):
+        asyncio.run(rm.check_open("BTCUSDT", Decimal("10")))
+
+
+def test_check_open_other_block_is_plain_risk_error():
+    rm = RiskManager(_Acct(0), L)
+    with pytest.raises(RiskError) as ei:
+        asyncio.run(rm.check_open("BTCUSDT", Decimal("5000")))
+    assert not isinstance(ei.value, KillSwitchError)
+
+
+def test_limits_from_env(monkeypatch):
+    from binance.risk import limits_from_env
+    monkeypatch.setenv("RISK_MAX_OPEN_POSITIONS", "3")
+    monkeypatch.setenv("RISK_DAILY_LOSS_LIMIT", "25")
+    lim = limits_from_env()
+    assert lim.max_open_positions == 3 and lim.daily_loss_limit == Decimal("25")
